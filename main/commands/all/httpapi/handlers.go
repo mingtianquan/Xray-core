@@ -492,9 +492,33 @@ func HandleAddOutboundFromURI() http.HandlerFunc {
 				SendJSONResponse(w, false, "解析vless URI失败: "+err.Error(), nil)
 				return
 			}
+		} else if strings.HasPrefix(request.Uri, "trojan://") {
+			log.Printf("检测到trojan协议")
+			configJSON, err = parseTrojanURI(request.Uri, request.Tag)
+			if err != nil {
+				log.Printf("解析trojan URI失败: %v", err)
+				SendJSONResponse(w, false, "解析trojan URI失败: "+err.Error(), nil)
+				return
+			}
+		} else if strings.HasPrefix(request.Uri, "ss://") {
+			log.Printf("检测到shadowsocks协议")
+			configJSON, err = parseShadowsocksURI(request.Uri, request.Tag)
+			if err != nil {
+				log.Printf("解析shadowsocks URI失败: %v", err)
+				SendJSONResponse(w, false, "解析shadowsocks URI失败: "+err.Error(), nil)
+				return
+			}
+		} else if strings.HasPrefix(request.Uri, "socks://") {
+			log.Printf("检测到socks协议")
+			configJSON, err = parseSocksURI(request.Uri, request.Tag)
+			if err != nil {
+				log.Printf("解析socks URI失败: %v", err)
+				SendJSONResponse(w, false, "解析socks URI失败: "+err.Error(), nil)
+				return
+			}
 		} else {
 			log.Printf("不支持的URI协议: %s", request.Uri)
-			SendJSONResponse(w, false, "不支持的URI协议，目前仅支持vmess://和vless://", nil)
+			SendJSONResponse(w, false, "不支持的URI协议，目前支持vmess://、vless://、trojan://、ss://和socks://", nil)
 			return
 		}
 
@@ -1058,6 +1082,164 @@ func parseVlessURI(uri string, tag string) (string, error) {
 	}
 
 	return string(jsonData), nil
+}
+
+// 解析trojan URI
+func parseTrojanURI(uri string, tag string) (string, error) {
+	// trojan链接格式：trojan://password@server:port?security=tls&sni=example.com&type=tcp&headerType=none#remarks
+	u, err := url.Parse(uri)
+	if err != nil {
+		return "", fmt.Errorf("URL解析失败: %v", err)
+	}
+
+	if u.Scheme != "trojan" {
+		return "", fmt.Errorf("不是有效的trojan链接")
+	}
+
+	// 获取必要参数
+	password := u.User.Username()
+	if password == "" {
+		return "", fmt.Errorf("未指定密码")
+	}
+
+	server := u.Hostname()
+	if server == "" {
+		return "", fmt.Errorf("未指定服务器地址")
+	}
+
+	port, err := strconv.Atoi(u.Port())
+	if err != nil || port <= 0 || port > 65535 {
+		return "", fmt.Errorf("无效的端口: %v", u.Port())
+	}
+
+	// 获取可选参数
+	queryParams := u.Query()
+
+	// 获取安全类型，默认为tls
+	security := queryParams.Get("security")
+	if security == "" {
+		security = "tls"
+	}
+
+	// 获取SNI参数
+	sni := queryParams.Get("sni")
+	if sni == "" {
+		// 如果没有sni参数，尝试peer参数(有些客户端使用)
+		sni = queryParams.Get("peer")
+	}
+	if sni == "" {
+		// 如果还是没有，默认使用服务器地址
+		sni = server
+	}
+
+	// 判断是否需要跳过TLS验证
+	allowInsecure := queryParams.Get("allowInsecure") == "1"
+
+	// 获取网络类型，默认为tcp
+	network := queryParams.Get("type")
+	if network == "" {
+		network = "tcp"
+	}
+
+	// 获取header类型
+	headerType := queryParams.Get("headerType")
+
+	// 获取备注
+	remark := u.Fragment
+	if remark == "" {
+		remark = server
+	}
+
+	// 构建outbound配置
+	// 基本设置
+	outboundJSON := fmt.Sprintf(`{
+		"outbounds": [
+			{
+				"protocol": "trojan",
+				"settings": {
+					"servers": [
+						{
+							"address": "%s",
+							"port": %d,
+							"password": "%s"
+						}
+					]
+				},
+				"tag": "%s"
+			}
+		]
+	}`, server, port, password, tag)
+
+	// 添加流设置
+	if security != "" || network != "" {
+		// 重新解析整个JSON
+		var jsonObj map[string]interface{}
+		err = json.Unmarshal([]byte(outboundJSON), &jsonObj)
+		if err != nil {
+			return "", fmt.Errorf("JSON处理失败: %v", err)
+		}
+
+		// 获取outbounds数组
+		outbounds, ok := jsonObj["outbounds"].([]interface{})
+		if !ok || len(outbounds) == 0 {
+			return "", fmt.Errorf("无效的outbounds配置")
+		}
+
+		// 添加streamSettings
+		firstOutbound := outbounds[0].(map[string]interface{})
+		streamSettings := map[string]interface{}{
+			"network": network,
+		}
+
+		// 添加安全设置
+		if security == "tls" {
+			streamSettings["security"] = "tls"
+			streamSettings["tlsSettings"] = map[string]interface{}{
+				"serverName":    sni,
+				"allowInsecure": allowInsecure,
+			}
+		}
+
+		// 如果指定了headerType，添加对应的头部设置
+		if headerType != "" && headerType != "none" {
+			switch network {
+			case "tcp":
+				streamSettings["tcpSettings"] = map[string]interface{}{
+					"header": map[string]interface{}{
+						"type": headerType,
+					},
+				}
+			case "ws":
+				streamSettings["wsSettings"] = map[string]interface{}{
+					"path": queryParams.Get("path"),
+					"headers": map[string]interface{}{
+						"Host": queryParams.Get("host"),
+					},
+				}
+			case "h2":
+				streamSettings["httpSettings"] = map[string]interface{}{
+					"path": queryParams.Get("path"),
+					"host": strings.Split(queryParams.Get("host"), ","),
+				}
+			case "grpc":
+				streamSettings["grpcSettings"] = map[string]interface{}{
+					"serviceName": queryParams.Get("serviceName"),
+				}
+			}
+		}
+
+		firstOutbound["streamSettings"] = streamSettings
+
+		// 转回JSON
+		newJson, err := json.MarshalIndent(jsonObj, "", "  ")
+		if err != nil {
+			return "", fmt.Errorf("JSON编码失败: %v", err)
+		}
+
+		outboundJSON = string(newJson)
+	}
+
+	return outboundJSON, nil
 }
 
 func HandleAddOutbound() http.HandlerFunc {
@@ -2092,4 +2274,424 @@ func HandleReload() http.HandlerFunc {
 			len(results.Inbounds), len(results.Outbounds), len(results.Rules), len(results.Errors))
 		SendJSONResponse(w, true, "配置重新加载完成", results)
 	}
+}
+
+// 解析shadowsocks URI
+func parseShadowsocksURI(uri string, tag string) (string, error) {
+	log.Printf("开始解析SS链接: %s", uri)
+	// Shadowsocks有多种URI格式:
+	// 1. ss://BASE64(method:password)@host:port?plugin=...#remarks
+	// 2. ss://BASE64(method:password@host:port)#remarks
+	// 3. ss://method:password@host:port?plugin=...#remarks
+
+	// 移除ss://前缀
+	uri = strings.TrimPrefix(uri, "ss://")
+	log.Printf("移除前缀后: %s", uri)
+
+	var method, password, host string
+	var port int
+	var plugin, pluginOpts string
+
+	// 尝试找到#标记的备注
+	parts := strings.SplitN(uri, "#", 2)
+	uri = parts[0]
+	remarks := ""
+	if len(parts) == 2 {
+		remarks = parts[1]
+		// URL解码备注
+		var err error
+		remarks, err = url.QueryUnescape(remarks)
+		if err != nil {
+			log.Printf("备注URL解码失败: %v", err)
+		}
+	}
+	log.Printf("移除备注后: %s", uri)
+
+	// 解析查询参数
+	var queryString string
+	if strings.Contains(uri, "?") {
+		queryParts := strings.SplitN(uri, "?", 2)
+		uri = queryParts[0]
+		queryString = queryParts[1]
+		log.Printf("查询参数: %s", queryString)
+
+		// 解析查询参数
+		query, err := url.ParseQuery(queryString)
+		if err == nil {
+			plugin = query.Get("plugin")
+			if plugin != "" {
+				// 如果插件参数格式是 plugin;config，提取插件选项
+				pluginParts := strings.SplitN(plugin, ";", 2)
+				if len(pluginParts) > 1 {
+					plugin = pluginParts[0]
+					pluginOpts = pluginParts[1]
+				}
+			}
+		}
+	}
+	log.Printf("移除查询参数后: %s", uri)
+
+	// 检查是否含有@符号，识别URI格式
+	if strings.Contains(uri, "@") {
+		log.Printf("检测到@符号，处理格式1或3")
+		// 格式1或3: ss://BASE64(method:password)@host:port 或 ss://method:password@host:port
+		atSplit := strings.SplitN(uri, "@", 2)
+		userInfoPart := atSplit[0]
+		serverPart := atSplit[1]
+		log.Printf("用户信息部分: %s, 服务器部分: %s", userInfoPart, serverPart)
+
+		// 检查是否是Base64编码
+		isBase64 := true
+		// 检查userInfoPart是否可能是Base64编码
+		for _, c := range userInfoPart {
+			if !((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '+' || c == '/' || c == '=' || c == '-' || c == '_') {
+				isBase64 = false
+				break
+			}
+		}
+		log.Printf("是否可能是Base64编码: %v", isBase64)
+
+		if isBase64 {
+			// 补齐Base64字符串以解决填充问题
+			paddingNeeded := len(userInfoPart) % 4
+			if paddingNeeded > 0 {
+				userInfoPart += strings.Repeat("=", 4-paddingNeeded)
+				log.Printf("补齐Base64填充后: %s", userInfoPart)
+			}
+
+			// 尝试Base64解码
+			var decodedUserInfo []byte
+			var err error
+
+			// 尝试标准Base64
+			decodedUserInfo, err = base64.StdEncoding.DecodeString(userInfoPart)
+			if err != nil {
+				log.Printf("标准Base64解码失败: %v", err)
+				// 尝试URL安全的Base64
+				decodedUserInfo, err = base64.URLEncoding.DecodeString(userInfoPart)
+				if err != nil {
+					log.Printf("URL安全Base64解码失败: %v", err)
+					// 尝试RawURLEncoding (没有填充的URL安全Base64)
+					decodedUserInfo, err = base64.RawURLEncoding.DecodeString(userInfoPart)
+					if err != nil {
+						log.Printf("RawURLBase64解码失败: %v", err)
+						// 尝试RawStdEncoding (没有填充的标准Base64)
+						decodedUserInfo, err = base64.RawStdEncoding.DecodeString(userInfoPart)
+						if err != nil {
+							log.Printf("RawStdBase64解码失败: %v", err)
+							// 都失败了，可能不是Base64编码
+							isBase64 = false
+						}
+					}
+				}
+			}
+
+			if isBase64 && err == nil {
+				// 解码成功，解析method:password
+				userInfoStr := string(decodedUserInfo)
+				log.Printf("Base64解码后的用户信息: %s", userInfoStr)
+				userInfoParts := strings.SplitN(userInfoStr, ":", 2)
+				if len(userInfoParts) == 2 {
+					method = userInfoParts[0]
+					password = userInfoParts[1]
+					log.Printf("解析得到 method: %s, password: %s", method, password)
+				} else {
+					log.Printf("Base64解码后的用户信息格式无效: %s", userInfoStr)
+					return "", fmt.Errorf("Base64解码后的无效用户信息格式: %s", userInfoStr)
+				}
+			} else {
+				log.Printf("Base64解码失败，尝试直接解析")
+				isBase64 = false
+			}
+		}
+
+		// 如果不是Base64编码或解码失败，直接解析
+		if !isBase64 {
+			userInfoParts := strings.SplitN(userInfoPart, ":", 2)
+			if len(userInfoParts) == 2 {
+				method = userInfoParts[0]
+				password = userInfoParts[1]
+				log.Printf("直接解析得到 method: %s, password: %s", method, password)
+			} else {
+				log.Printf("用户信息部分格式无效: %s", userInfoPart)
+				return "", fmt.Errorf("无效的用户信息格式: %s", userInfoPart)
+			}
+		}
+
+		// 解析服务器部分 host:port
+		serverParts := strings.SplitN(serverPart, ":", 2)
+		if len(serverParts) != 2 {
+			log.Printf("服务器信息格式无效: %s", serverPart)
+			return "", fmt.Errorf("无效的服务器信息格式: %s", serverPart)
+		}
+		host = serverParts[0]
+		var parseErr error
+		port, parseErr = strconv.Atoi(serverParts[1])
+		if parseErr != nil || port <= 0 || port > 65535 {
+			log.Printf("端口无效: %s, 错误: %v", serverParts[1], parseErr)
+			return "", fmt.Errorf("无效的端口: %v", serverParts[1])
+		}
+		log.Printf("解析得到 host: %s, port: %d", host, port)
+	} else {
+		log.Printf("未检测到@符号，处理格式2")
+		// 格式2: ss://BASE64(method:password@host:port)
+
+		// 补齐Base64字符串以解决填充问题
+		paddingNeeded := len(uri) % 4
+		if paddingNeeded > 0 {
+			uri += strings.Repeat("=", 4-paddingNeeded)
+			log.Printf("补齐Base64填充后: %s", uri)
+		}
+
+		// 尝试多种Base64解码方式
+		var data []byte
+		var err error
+		var decoded bool = false
+
+		// 尝试所有可能的Base64解码方式
+		decoders := []struct {
+			name    string
+			decoder *base64.Encoding
+		}{
+			{"StdEncoding", base64.StdEncoding},
+			{"URLEncoding", base64.URLEncoding},
+			{"RawURLEncoding", base64.RawURLEncoding},
+			{"RawStdEncoding", base64.RawStdEncoding},
+		}
+
+		for _, decoder := range decoders {
+			data, err = decoder.decoder.DecodeString(uri)
+			if err == nil {
+				log.Printf("使用 %s 成功解码", decoder.name)
+				decoded = true
+				break
+			} else {
+				log.Printf("使用 %s 解码失败: %v", decoder.name, err)
+			}
+		}
+
+		if !decoded {
+			log.Printf("所有Base64解码方式都失败")
+			return "", fmt.Errorf("Base64解码失败: %v", err)
+		}
+
+		// 解析为 method:password@host:port 格式
+		decodedStr := string(data)
+		log.Printf("Base64解码后: %s", decodedStr)
+		if !strings.Contains(decodedStr, "@") {
+			log.Printf("解码后的字符串不包含@符号: %s", decodedStr)
+			return "", fmt.Errorf("无效的Shadowsocks URI格式: 解码后未找到@符号")
+		}
+
+		atSplit := strings.SplitN(decodedStr, "@", 2)
+		if len(atSplit) != 2 {
+			log.Printf("解码后@分割失败: %s", decodedStr)
+			return "", fmt.Errorf("无效的Shadowsocks URI格式: @分割后格式错误")
+		}
+
+		// 分解method:password部分
+		userInfoParts := strings.SplitN(atSplit[0], ":", 2)
+		if len(userInfoParts) != 2 {
+			log.Printf("用户信息部分格式无效: %s", atSplit[0])
+			return "", fmt.Errorf("无效的用户信息格式: %s", atSplit[0])
+		}
+		method = userInfoParts[0]
+		password = userInfoParts[1]
+		log.Printf("解析得到 method: %s, password: %s", method, password)
+
+		// 分解host:port部分
+		serverParts := strings.SplitN(atSplit[1], ":", 2)
+		if len(serverParts) != 2 {
+			log.Printf("服务器信息格式无效: %s", atSplit[1])
+			return "", fmt.Errorf("无效的服务器信息格式: %s", atSplit[1])
+		}
+		host = serverParts[0]
+		var parseErr error
+		port, parseErr = strconv.Atoi(serverParts[1])
+		if parseErr != nil || port <= 0 || port > 65535 {
+			log.Printf("端口无效: %s, 错误: %v", serverParts[1], parseErr)
+			return "", fmt.Errorf("无效的端口: %v", serverParts[1])
+		}
+		log.Printf("解析得到 host: %s, port: %d", host, port)
+	}
+
+	// 检查是否成功提取了所有必要参数
+	if method == "" || password == "" || host == "" || port == 0 {
+		log.Printf("缺少必要参数: method=%s, password=%s, host=%s, port=%d", method, password, host, port)
+		return "", fmt.Errorf("缺少必要参数: method=%s, password=%s, host=%s, port=%d", method, password, host, port)
+	}
+
+	// 如果没有指定备注，使用主机名作为备注
+	if remarks == "" {
+		remarks = host
+	}
+	log.Printf("最终备注: %s", remarks)
+
+	// 构建outbound配置
+	var outboundJSON string
+
+	if plugin == "" {
+		// 无插件的基本配置
+		outboundJSON = fmt.Sprintf(`{
+			"outbounds": [
+				{
+					"protocol": "shadowsocks",
+					"settings": {
+						"servers": [
+							{
+								"address": "%s",
+								"port": %d,
+								"method": "%s",
+								"password": "%s"
+							}
+						]
+					},
+					"tag": "%s"
+				}
+			]
+		}`, host, port, method, password, tag)
+	} else {
+		// 带插件的配置
+		pluginConfig := ""
+		if plugin == "obfs-local" || plugin == "obfs" {
+			// obfs插件配置转换为Xray的obfs设置
+			pluginConfig = fmt.Sprintf(`
+			"streamSettings": {
+				"network": "tcp",
+				"security": "",
+				"tcpSettings": {
+					"header": {
+						"type": "http",
+						"request": {
+							"version": "1.1",
+							"method": "GET",
+							"path": ["/"],
+							"headers": {
+								"Host": ["%s"],
+								"User-Agent": ["Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/92.0.4515.131 Safari/537.36"],
+								"Accept-Encoding": ["gzip, deflate"],
+								"Connection": ["keep-alive"],
+								"Pragma": "no-cache"
+							}
+						}
+					}
+				}
+			}`, host)
+		} else {
+			// 其他插件暂不支持，添加注释
+			pluginConfig = fmt.Sprintf(`
+			"_pluginInfo": {
+				"plugin": "%s",
+				"pluginOpts": "%s"
+			}`, plugin, pluginOpts)
+		}
+
+		outboundJSON = fmt.Sprintf(`{
+			"outbounds": [
+				{
+					"protocol": "shadowsocks",
+					"settings": {
+						"servers": [
+							{
+								"address": "%s",
+								"port": %d,
+								"method": "%s",
+								"password": "%s"
+							}
+						]
+					},
+					"tag": "%s",
+					%s
+				}
+			]
+		}`, host, port, method, password, tag, pluginConfig)
+	}
+
+	log.Printf("生成出站配置成功")
+	return outboundJSON, nil
+}
+
+// 解析socks URI
+func parseSocksURI(uri string, tag string) (string, error) {
+	// socks链接格式: socks://[username:password@]host:port#remarks
+	u, err := url.Parse(uri)
+	if err != nil {
+		return "", fmt.Errorf("URL解析失败: %v", err)
+	}
+
+	if u.Scheme != "socks" {
+		return "", fmt.Errorf("不是有效的socks链接")
+	}
+
+	// 获取必要参数
+	server := u.Hostname()
+	if server == "" {
+		return "", fmt.Errorf("未指定服务器地址")
+	}
+
+	port, err := strconv.Atoi(u.Port())
+	if err != nil || port <= 0 || port > 65535 {
+		return "", fmt.Errorf("无效的端口: %v", u.Port())
+	}
+
+	// 获取用户名和密码（如果有）
+	var username, password string
+	if u.User != nil {
+		username = u.User.Username()
+		password, _ = u.User.Password()
+	}
+
+	// 获取备注
+	remark := u.Fragment
+	if remark == "" {
+		remark = server
+	}
+
+	// 构建outbound配置
+	var outboundJSON string
+	if username != "" && password != "" {
+		// 有认证信息
+		outboundJSON = fmt.Sprintf(`{
+			"outbounds": [
+				{
+					"protocol": "socks",
+					"settings": {
+						"servers": [
+							{
+								"address": "%s",
+								"port": %d,
+								"users": [
+									{
+										"user": "%s",
+										"pass": "%s"
+									}
+								]
+							}
+						]
+					},
+					"tag": "%s"
+				}
+			]
+		}`, server, port, username, password, tag)
+	} else {
+		// 无认证信息
+		outboundJSON = fmt.Sprintf(`{
+			"outbounds": [
+				{
+					"protocol": "socks",
+					"settings": {
+						"servers": [
+							{
+								"address": "%s",
+								"port": %d
+							}
+						]
+					},
+					"tag": "%s"
+				}
+			]
+		}`, server, port, tag)
+	}
+
+	return outboundJSON, nil
 }

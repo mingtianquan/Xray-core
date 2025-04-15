@@ -56,7 +56,7 @@ var (
 
 // 加载或创建配置文件
 func InitConfig() {
-	// 检查配置文件是否存在是的
+	// 检查配置文件是否存在
 	if _, err := os.Stat(GetConfigFileName()); os.IsNotExist(err) {
 		// 文件不存在，创建默认配置
 		defaultConfig := &ServerConfig{
