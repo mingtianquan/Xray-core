@@ -1,6 +1,7 @@
 package api
 
 import (
+	"github.com/xtls/xray-core/main/commands/all/httpapi"
 	"github.com/xtls/xray-core/main/commands/base"
 )
 
@@ -28,5 +29,6 @@ var CmdAPI = &base.Command{
 		cmdSourceIpBlock,
 		cmdOnlineStats,
 		cmdOnlineStatsIpList,
+		httpapi.CmdHTTPAPI,
 	},
 }
