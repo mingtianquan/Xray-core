@@ -145,6 +145,7 @@ func registerHandlers() {
 
 	// 入站相关
 	http.HandleFunc("/api/inbounds/socks", HandleAddSocksInbound())
+	http.HandleFunc("/api/inbounds/socks/uri", HandleAddSocksInbound()) // 显式支持通过URI添加socks入站
 	http.HandleFunc("/api/inbounds/remove", HandleRemoveInbound())
 	http.HandleFunc("/api/inbounds/list", HandleListInbounds())
 
