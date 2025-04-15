@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	handlerService "github.com/xtls/xray-core/app/proxyman/command"
 	routerService "github.com/xtls/xray-core/app/router/command"
@@ -241,7 +242,138 @@ func HandleAddSocksInbound() http.HandlerFunc {
 		body, _ := io.ReadAll(r.Body)
 		log.Printf("收到请求体: %s", string(body))
 
-		// 直接使用请求体中的JSON
+		// 检查是否是通过socks链接添加
+		var uriRequest struct {
+			Uri string `json:"uri"`
+			Tag string `json:"tag"`
+		}
+
+		err := json.Unmarshal(body, &uriRequest)
+		if err == nil && uriRequest.Uri != "" && strings.HasPrefix(uriRequest.Uri, "socks://") {
+			log.Printf("检测到Socks链接添加方式: %s", uriRequest.Uri)
+
+			// 如果没有指定tag，生成一个默认的
+			if uriRequest.Tag == "" {
+				uriRequest.Tag = fmt.Sprintf("socks_in_%d", time.Now().Unix())
+				log.Printf("未指定Tag，使用默认值: %s", uriRequest.Tag)
+			}
+
+			// 解析socks链接并创建入站配置
+			configJSON, err := parseSocksInboundURI(uriRequest.Uri, uriRequest.Tag)
+			if err != nil {
+				log.Printf("解析socks链接失败: %v", err)
+				SendJSONResponse(w, false, "解析socks链接失败: "+err.Error(), nil)
+				return
+			}
+
+			log.Printf("从socks链接生成的配置: %s", configJSON)
+
+			// 使用生成的配置
+			conf, err := jsonconf.DecodeJSONConfig(strings.NewReader(configJSON))
+			if err != nil {
+				log.Printf("配置解析失败: %v", err)
+				SendJSONResponse(w, false, "配置解析失败: "+err.Error(), nil)
+				return
+			}
+
+			if len(conf.InboundConfigs) == 0 {
+				log.Printf("没有有效的入站配置")
+				SendJSONResponse(w, false, "没有有效的入站配置", nil)
+				return
+			}
+
+			// 连接到API服务器并添加入站
+			conn, ctx, cleanup, err := ConnectToAPI(apiAddr, timeout)
+			if err != nil {
+				log.Printf("连接API服务器失败: %v", err)
+				SendJSONResponse(w, false, "连接API服务器失败: "+err.Error(), nil)
+				return
+			}
+			defer cleanup()
+
+			// 添加入站
+			client := handlerService.NewHandlerServiceClient(conn)
+			inboundConf := conf.InboundConfigs[0]
+			i, err := inboundConf.Build()
+			if err != nil {
+				log.Printf("构建配置失败: %v", err)
+				SendJSONResponse(w, false, "构建配置失败: "+err.Error(), nil)
+				return
+			}
+
+			req := &handlerService.AddInboundRequest{
+				Inbound: i,
+			}
+			resp, err := client.AddInbound(ctx, req)
+			if err != nil {
+				log.Printf("添加入站失败: %v", err)
+				SendJSONResponse(w, false, "添加入站失败: "+err.Error(), nil)
+				return
+			}
+
+			log.Printf("入站添加成功: %s", uriRequest.Tag)
+
+			// 保存入站配置
+			inboundConfig := InboundConfig{
+				Tag:      uriRequest.Tag,
+				Protocol: "socks",
+				Settings: make(map[string]interface{}),
+			}
+
+			// 尝试从JSON配置提取端口信息
+			var metaData map[string]interface{}
+			inboundJSON, _ := json.Marshal(inboundConf)
+			if jsonErr := json.Unmarshal(inboundJSON, &metaData); jsonErr == nil {
+				if portValue, ok := metaData["port"]; ok {
+					if portStr, ok := portValue.(string); ok {
+						portNum, portErr := strconv.Atoi(portStr)
+						if portErr == nil {
+							inboundConfig.Port = portNum
+						}
+					} else if portInt, ok := portValue.(float64); ok {
+						inboundConfig.Port = int(portInt)
+					} else if portInt, ok := portValue.(int); ok {
+						inboundConfig.Port = portInt
+					}
+				}
+			}
+
+			// 添加监听地址
+			if inboundConf.ListenOn != nil {
+				inboundConfig.Listen = inboundConf.ListenOn.String()
+			}
+
+			// 尝试提取设置信息
+			if inboundConf.Settings != nil {
+				var settings map[string]interface{}
+				settingsJSON, _ := json.Marshal(inboundConf.Settings)
+				json.Unmarshal(settingsJSON, &settings)
+				inboundConfig.Settings = settings
+			}
+
+			// 保存到配置
+			AddInbound(inboundConfig)
+
+			// 如果启用了保存到官方配置
+			if saveToConfig {
+				// 检查configPath是否指向HTTP API自己的配置文件
+				if configPath == GetConfigFileName() {
+					log.Printf("警告: 配置路径指向HTTP API配置文件，跳过重复保存")
+				} else {
+					err := SaveToXrayConfig(configPath, &inboundConfig, nil, nil)
+					if err != nil {
+						log.Printf("保存到Xray配置文件失败: %v", err)
+					} else {
+						log.Printf("成功保存入站 %s 到Xray配置文件", inboundConfig.Tag)
+					}
+				}
+			}
+
+			SendJSONResponse(w, true, "成功添加入站: "+uriRequest.Tag, resp)
+			return
+		}
+
+		// 如果不是通过socks链接添加，则使用原有的方式处理
 		conf, err := jsonconf.DecodeJSONConfig(strings.NewReader(string(body)))
 		if err != nil {
 			log.Printf("配置解析失败: %v", err)
@@ -2694,4 +2826,92 @@ func parseSocksURI(uri string, tag string) (string, error) {
 	}
 
 	return outboundJSON, nil
+}
+
+// 解析socks链接并生成入站配置
+func parseSocksInboundURI(uri string, tag string) (string, error) {
+	log.Printf("开始解析Socks入站链接: %s", uri)
+	// socks链接格式: socks://[username:password@]host:port#remarks
+	u, err := url.Parse(uri)
+	if err != nil {
+		return "", fmt.Errorf("URL解析失败: %v", err)
+	}
+
+	if u.Scheme != "socks" {
+		return "", fmt.Errorf("不是有效的socks链接")
+	}
+
+	// 获取端口
+	port, err := strconv.Atoi(u.Port())
+	if err != nil || port <= 0 || port > 65535 {
+		return "", fmt.Errorf("无效的端口: %v", u.Port())
+	}
+
+	// 获取主机
+	host := u.Hostname()
+	if host == "" {
+		host = "0.0.0.0" // 默认绑定所有接口
+	}
+
+	// 获取用户名和密码（如果有）
+	var auth bool = false
+	var username, password string
+	if u.User != nil {
+		auth = true
+		username = u.User.Username()
+		password, _ = u.User.Password()
+	}
+
+	// 获取备注
+	remark := u.Fragment
+	if remark == "" {
+		remark = fmt.Sprintf("socks-%d", port)
+	}
+
+	// 构建入站配置
+	var configJSON string
+	if auth {
+		// 有认证信息
+		configJSON = fmt.Sprintf(`{
+			"inbounds": [
+				{
+					"port": %d,
+					"protocol": "socks",
+					"listen": "%s",
+					"settings": {
+						"auth": "password",
+						"accounts": [
+							{
+								"user": "%s",
+								"pass": "%s"
+							}
+						],
+						"udp": true,
+						"ip": "127.0.0.1"
+					},
+					"tag": "%s"
+				}
+			]
+		}`, port, host, username, password, tag)
+	} else {
+		// 无认证信息
+		configJSON = fmt.Sprintf(`{
+			"inbounds": [
+				{
+					"port": %d,
+					"protocol": "socks",
+					"listen": "%s",
+					"settings": {
+						"auth": "noauth",
+						"udp": true,
+						"ip": "127.0.0.1"
+					},
+					"tag": "%s"
+				}
+			]
+		}`, port, host, tag)
+	}
+
+	log.Printf("生成的入站配置: %s", configJSON)
+	return configJSON, nil
 }
