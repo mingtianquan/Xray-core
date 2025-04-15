@@ -176,7 +176,7 @@ xray httpapi -api "127.0.0.1:10089" -http ":8080" -config "http-api.json"
     {
       "tag": "api",
       "listen": "127.0.0.1",
-      "port": 8080,
+      "port": 10089,
       "protocol": "dokodemo-door",
       "settings": {
         "address": "127.0.0.1"
