@@ -158,7 +158,9 @@ CGO_ENABLED=0 go build -o xray -trimpath -buildvcs=false -ldflags="-X github.com
 ## HTTP API 接口文档
 
 Xray-core提供了HTTP API接口，可以通过HTTP请求动态管理Xray配置。
+## 运行命令
 xray run -c config.json
+## httpapi运行命令
 xray httpapi -api "127.0.0.1:10089" -http ":8080" -config "http-api.json"
 ### 基本配置
 
